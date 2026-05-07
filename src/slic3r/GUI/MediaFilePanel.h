@@ -79,6 +79,7 @@ private:
     bool m_external = true;
 
     std::string m_machine;
+    std::string m_printer_type; // e.g. "BL-P002" — gates LAN-only FTPS path
     std::string m_lan_ip;
     std::string m_lan_user;
     std::string m_lan_passwd;

@@ -1,4 +1,7 @@
 #include "MediaFilePanel.h"
+
+#include <set>
+
 #include "ImageGrid.h"
 #include "I18N.hpp"
 #include "GUI_App.hpp"
@@ -222,6 +225,7 @@ void MediaFilePanel::UpdateByObj(MachineObject* obj)
         m_lan_mode     = obj->is_lan_mode_printer();
         m_lan_ip       = obj->get_dev_ip();
         m_lan_passwd   = obj->get_access_code();
+        m_printer_type = obj->printer_type;
         m_dev_ver      = obj->get_ota_version();
         m_device_busy  = obj->is_camera_busy_off();
         m_local_proto  = obj->file_local;
@@ -236,6 +240,7 @@ void MediaFilePanel::UpdateByObj(MachineObject* obj)
         m_lan_mode  = false;
         m_lan_ip.clear();
         m_lan_passwd.clear();
+        m_printer_type.clear();
         m_dev_ver.clear();
         m_device_busy = false;
         m_local_proto = 0;
@@ -487,6 +492,37 @@ void MediaFilePanel::fetchUrl(boost::weak_ptr<PrinterFileSystem> wfs)
         return;
     }
     if (m_lan_mode) {
+        // Bambu printers in LAN-only / Developer Mode expose implicit FTPS on
+        // port 990 (user "bblp", password = access code). FtpsTransport
+        // synthesizes Bambu-shaped JSON responses on top.
+        //
+        // The on-printer filesystem layout is firmware-family-specific (X1/X1C
+        // serve files at FTP root with /timelapse/ for recordings; P1P/P1S
+        // use a /sdcard/ prefix; later models may differ again). Right now
+        // FtpsTransport hardcodes the X1/X1C layout, so gate the path on
+        // known-supported models and fall back to the original "not
+        // supported" message otherwise. To enable a new model, verify its
+        // layout and add it here AND extend FtpsTransport::FolderForType.
+        static const std::set<std::string> kFtpsSupportedTypes = {
+            "BL-P001", // X1
+            "BL-P002", // X1C
+        };
+        bool ftps_supported = kFtpsSupportedTypes.count(m_printer_type) > 0;
+        if (ftps_supported && !m_lan_ip.empty() && !m_lan_passwd.empty()) {
+            // IPv6 literals must be bracketed in URLs. Bambu LAN discovery is
+            // IPv4 today but bracketing is cheap insurance.
+            std::string host = (m_lan_ip.find(':') != std::string::npos)
+                                   ? "[" + m_lan_ip + "]"
+                                   : m_lan_ip;
+            std::string url  = "ftps://bblp:" + wxGetApp().url_encode(m_lan_passwd)
+                              + "@" + host + ":990/";
+            // Don't log the URL (carries the access code in cleartext —
+            // hide_passwd's matching rules don't cover the user:pass@ form).
+            BOOST_LOG_TRIVIAL(info) << "MediaFilePanel::fetchUrl: ftps://"
+                                    << host << ":990/ (model " << m_printer_type << ")";
+            fs->SetUrl(url);
+            return;
+        }
         m_image_grid->SetStatus(m_bmp_failed, _L("Browsing file in storage is not supported in LAN Only Mode."));
         fs->SetUrl("0");
         return;
