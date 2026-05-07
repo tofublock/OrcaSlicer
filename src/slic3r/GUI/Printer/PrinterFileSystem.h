@@ -3,6 +3,7 @@
 
 #define BAMBU_DYNAMIC
 #include "BambuTunnel.h"
+#include "IPrinterFileTransport.h"
 
 #include <wx/bitmap.h>
 #include <wx/event.h>
@@ -15,6 +16,7 @@ using nlohmann::json;
 
 #include <functional>
 #include <deque>
+#include <memory>
 
 wxDECLARE_EVENT(EVT_STATUS_CHANGED, wxCommandEvent);
 wxDECLARE_EVENT(EVT_MODE_CHANGED, wxCommandEvent);
@@ -346,7 +348,7 @@ private:
 
     void RecvMessageThread();
 
-    void HandleResponse(boost::unique_lock<boost::mutex> &l, Bambu_Sample const &sample);
+    void HandleResponse(boost::unique_lock<boost::mutex> &l, IPrinterFileTransport::Sample const &sample);
 
     void Reconnect(boost::unique_lock<boost::mutex> & l, int result);
 
@@ -380,12 +382,8 @@ private:
     std::vector<bool> m_download_states;
 
 private:
-    struct Session
-    {
-        Bambu_Tunnel tunnel = nullptr;
-        PrinterFileSystem * owner;
-    };
-    Session m_session;
+    std::unique_ptr<IPrinterFileTransport> m_transport;
+    bool m_quit = false; // set by Stop(quit=true) to make the recv thread exit
     boost::uint32_t m_sequence = 0;
     boost::uint32_t m_download_seq = 0;
     boost::uint32_t m_fetch_model_seq = 0;

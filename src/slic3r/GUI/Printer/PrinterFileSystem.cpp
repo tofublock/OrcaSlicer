@@ -1,4 +1,6 @@
 #include "PrinterFileSystem.h"
+#include "BambuTunnelTransport.h"
+#include "FtpsTransport.h"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Model.hpp"
@@ -84,7 +86,6 @@ PrinterFileSystem::PrinterFileSystem()
         default_thumbnail = wxBitmap(default_thumbnail.ConvertToImage(), -1, 1);
 #endif
     }
-    m_session.owner = this;
 #ifdef PRINTER_FILE_SYSTEM_TEST
     auto time = wxDateTime::Now();
     wxString path = "D:\\work\\pic\\";
@@ -130,7 +131,7 @@ void PrinterFileSystem::SetFileType(FileType type, std::string const &storage)
     SendChangedEvent(EVT_FILE_CHANGED);
     if (type == F_INVALID_TYPE)
         return;
-    if (m_session.tunnel == nullptr)
+    if (!m_transport || !m_transport->IsOpen())
         return;
     m_status = Status::ListSyncing;
     SendChangedEvent(EVT_STATUS_CHANGED, m_status);
@@ -694,7 +695,7 @@ void PrinterFileSystem::Stop(bool quit)
 {
     boost::unique_lock l(m_mutex);
     if (quit) {
-        m_session.owner = nullptr;
+        m_quit = true;
     } else if (m_stopped) {
         return;
     }
@@ -1430,7 +1431,7 @@ void PrinterFileSystem::CancelUploadTask(bool send_cancel_req)
 
 boost::uint32_t PrinterFileSystem::SendRequest(int type, json const &req, callback_t2 const &callback,const std::string& param)
 {
-    if (m_session.tunnel == nullptr) {
+    if (!m_transport || !m_transport->IsOpen()) {
         Retry();
         callback(ERROR_PIPE, json(), nullptr);
         return 0;
@@ -1513,13 +1514,13 @@ void PrinterFileSystem::CancelRequests2(std::vector<boost::uint32_t> const &seqs
 
 void PrinterFileSystem::RecvMessageThread()
 {
-    Bambu_Sample sample;
+    IPrinterFileTransport::Sample sample;
     boost::unique_lock l(m_mutex);
     Reconnect(l, 0);
     while (true) {
-        if (m_stopped && (m_session.owner == nullptr || (m_messages.empty() && m_callbacks.empty()))) {
+        if (m_stopped && (m_quit || (m_messages.empty() && m_callbacks.empty()))) {
             Reconnect(l, 0); // Close and wait start again
-            if (m_session.owner == nullptr) {
+            if (m_quit) {
                 // clear callbacks first
                 auto callbacks(std::move(m_callbacks));
                 break;
@@ -1566,28 +1567,26 @@ void PrinterFileSystem::RecvMessageThread()
         }
         if (!m_messages.empty()) {
             auto & msg = m_messages.front();
-            // OutputDebugStringA(msg.c_str());
-            // OutputDebugStringA("\n");
             wxLogInfo("PrinterFileSystem::SendRequest >>>: \n%s\n", wxString::FromUTF8(msg));
             l.unlock();
-            int n = Bambu_SendMessage(m_session.tunnel, CTRL_TYPE, msg.c_str(), msg.length());
+            int n = m_transport ? m_transport->SendMessage(CTRL_TYPE, msg.c_str(), msg.length()) : -1;
             l.lock();
             if (n == 0)
                 m_messages.pop_front();
-            else if (n != Bambu_would_block) {
+            else if (n != IPrinterFileTransport::WOULD_BLOCK) {
                 Reconnect(l, n);
                 continue;
             }
         }
         l.unlock();
-        int n = Bambu_ReadSample(m_session.tunnel, &sample);
+        int n = m_transport ? m_transport->ReadSample(sample) : IPrinterFileTransport::STREAM_END;
         l.lock();
         if (n == 0) {
             HandleResponse(l, sample);
-        } else if (n == Bambu_stream_end) {
+        } else if (n == IPrinterFileTransport::STREAM_END) {
             m_stopped = true;
             Reconnect(l, m_status == ListSyncing ? ERROR_RES_BUSY : ERROR_PIPE);
-        } else if (n == Bambu_would_block) {
+        } else if (n == IPrinterFileTransport::WOULD_BLOCK) {
             m_cond.timed_wait(l, boost::posix_time::milliseconds(m_messages.empty() && m_callbacks.empty() ? 1000 : 20));
         } else {
             Reconnect(l, n);
@@ -1595,7 +1594,7 @@ void PrinterFileSystem::RecvMessageThread()
     } // while
 }
 
-void PrinterFileSystem::HandleResponse(boost::unique_lock<boost::mutex> &l, Bambu_Sample const &sample)
+void PrinterFileSystem::HandleResponse(boost::unique_lock<boost::mutex> &l, IPrinterFileTransport::Sample const &sample)
 {
     unsigned char const *end      = sample.buffer + sample.size;
     unsigned char const *json_end = (unsigned char const *) memchr(sample.buffer, '\n', sample.size);
@@ -1671,16 +1670,13 @@ void PrinterFileSystem::HandleResponse(boost::unique_lock<boost::mutex> &l, Bamb
 
 void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int result)
 {
-    if (m_session.tunnel) {
-        auto tunnel = m_session.tunnel;
-        m_session.tunnel = nullptr;
+    if (m_transport && m_transport->IsOpen()) {
         wxLogMessage("PrinterFileSystem::Reconnect close %d", result);
         l.unlock();
-        Bambu_Close(tunnel);
-        Bambu_Destroy(tunnel);
+        m_transport->Close();
         l.lock();
     }
-    if (m_session.owner == nullptr)
+    if (m_quit)
         return;
     json r;
     while(!m_callbacks.empty()) {
@@ -1696,7 +1692,7 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
 
     while (true) {
         while (m_stopped) {
-            if (m_session.owner == nullptr)
+            if (m_quit)
                 return;
            m_status = Status::Reconnecting;
            SendChangedEvent(EVT_STATUS_CHANGED, m_status);
@@ -1723,21 +1719,27 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
             m_status = Status::Connecting;
             wxLogMessage("PrinterFileSystem::Reconnect Connecting");
             SendChangedEvent(EVT_STATUS_CHANGED, m_status);
-            Bambu_Tunnel tunnel = nullptr;
-            int ret = Bambu_Create(&tunnel, url.c_str());
-            if (ret == 0) {
 
-                Bambu_SetLogger(tunnel, DumpLog, this);
-                ret = Bambu_Open(tunnel);
+            // Pick transport from URL scheme. ftps:// → native FTPS for Bambu
+            // LAN-only / Developer Mode; everything else goes through the
+            // closed-source Bambu network plugin.
+            std::unique_ptr<IPrinterFileTransport> transport;
+            if (url.compare(0, 7, "ftps://") == 0) {
+                transport.reset(new FtpsTransport(url));
+            } else {
+                transport.reset(new BambuTunnelTransport(url, *this));
             }
+            transport->SetLogger(DumpLog, this);
+
+            int ret = transport->Open();
 
             if (ret == 0)
             {
                 auto                             start_time = boost::posix_time::microsec_clock::universal_time();
                 boost::posix_time::time_duration timeout    = boost::posix_time::seconds(3);
                 do{
-                    ret = Bambu_StartStreamEx ? Bambu_StartStreamEx(tunnel, CTRL_TYPE) : Bambu_StartStream(tunnel, false);
-                    if (ret == Bambu_would_block)
+                    ret = transport->StartStream(CTRL_TYPE);
+                    if (ret == IPrinterFileTransport::WOULD_BLOCK)
                         boost::this_thread::sleep(boost::posix_time::milliseconds(100));
 
                      auto now = boost::posix_time::microsec_clock::universal_time();
@@ -1746,21 +1748,18 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
                         break;
                     }
 
-                } while (ret == Bambu_would_block && !m_stopped);
+                } while (ret == IPrinterFileTransport::WOULD_BLOCK && !m_stopped);
             }
             l.lock();
             if (ret == 0) {
-                m_session.tunnel = tunnel;
+                m_transport = std::move(transport);
                 wxLogMessage("PrinterFileSystem::Reconnect Connected");
                 break;
             } else if (ret == 1) {
                 m_stopped = true;
                 ret = ERROR_RES_BUSY;
             }
-            if (tunnel) {
-                Bambu_Close(tunnel);
-                Bambu_Destroy(tunnel);
-            }
+            transport.reset();
             m_last_error = ret;
         }
         wxLogMessage("PrinterFileSystem::Reconnect Failed");

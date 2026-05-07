@@ -387,6 +387,9 @@ set(SLIC3R_GUI_SOURCES
     GUI/PresetHints.hpp
     GUI/PrinterCloudAuthDialog.cpp
     GUI/PrinterCloudAuthDialog.hpp
+    GUI/Printer/IPrinterFileTransport.h
+    GUI/Printer/BambuTunnelTransport.cpp
+    GUI/Printer/BambuTunnelTransport.h
     GUI/Printer/PrinterFileSystem.cpp
     GUI/Printer/PrinterFileSystem.h
     GUI/PrinterWebView.cpp
