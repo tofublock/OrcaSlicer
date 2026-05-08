@@ -124,9 +124,11 @@ bool parse_list_line(std::string const& raw_line,
         if (c != std::string::npos) minute = std::atoi(toks[7].c_str() + c + 1);
         // Standard `ls -l` rule: when the year is omitted, the file is within
         // the last ~6 months. If (mon,day) lies in the future relative to
-        // today, it actually refers to the previous year.
+        // today, it actually refers to the previous year. Compare in local
+        // time because Bambu's busybox `ls` prints the printer's local time,
+        // not UTC.
         std::time_t now = std::time(nullptr);
-        std::tm*    nt  = std::gmtime(&now);
+        std::tm*    nt  = std::localtime(&now);
         if (nt) {
             year = nt->tm_year + 1900;
             if (mon > nt->tm_mon || (mon == nt->tm_mon && day > nt->tm_mday))
@@ -141,16 +143,18 @@ bool parse_list_line(std::string const& raw_line,
     mtime = 0;
     if (mon >= 0 && day > 0 && year > 0) {
         std::tm tm{};
-        tm.tm_year = year - 1900;
-        tm.tm_mon  = mon;
-        tm.tm_mday = day;
-        tm.tm_hour = hour;
-        tm.tm_min  = minute;
-#ifdef _WIN32
-        mtime = _mkgmtime(&tm);
-#else
-        mtime = timegm(&tm);
-#endif
+        tm.tm_year  = year - 1900;
+        tm.tm_mon   = mon;
+        tm.tm_mday  = day;
+        tm.tm_hour  = hour;
+        tm.tm_min   = minute;
+        tm.tm_isdst = -1;
+        // mktime treats the broken-down time as host-local. Bambu's `ls`
+        // emits printer-local time; we don't know the printer's TZ, so
+        // approximate by treating it as the slicer host's TZ. That matches
+        // when the user is colocated with their printer (the common case);
+        // worst case the displayed mtime is off by hours, never by days.
+        mtime = std::mktime(&tm);
     }
     return true;
 }
@@ -223,6 +227,19 @@ size_t curl_write_to_sink(char* ptr, size_t size, size_t nmemb, void* userdata)
     if (!(*sink)(reinterpret_cast<unsigned char const*>(ptr), n))
         return 0; // abort transfer
     return n;
+}
+
+// Progress callback: returning non-zero aborts the transfer. Without this,
+// libcurl only re-checks the write callback when bytes arrive, so a stalled
+// download could keep Close() blocked for the whole CURLOPT_LOW_SPEED_TIME
+// window. The progress callback fires on a small internal timer regardless
+// of data flow, so m_quit is honored within ~1s of being set.
+int curl_abort_on_quit(void* clientp,
+                       curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
+                       curl_off_t /*ultotal*/, curl_off_t /*ulnow*/)
+{
+    auto* quit = static_cast<std::atomic<bool>*>(clientp);
+    return (quit && quit->load()) ? 1 : 0;
 }
 
 } // namespace
@@ -320,12 +337,20 @@ int FtpsTransport::SendMessage(int /*ctrl_type*/, char const* data, int len)
 
 int FtpsTransport::ReadSample(Sample& out)
 {
-    std::lock_guard<std::mutex> l(m_mutex);
-    if (!m_pending_samples.empty()) {
-        m_current_sample = std::move(m_pending_samples.front());
-        m_pending_samples.pop_front();
-        out.buffer = m_current_sample.data();
-        out.size   = m_current_sample.size();
+    bool drained = false;
+    {
+        std::lock_guard<std::mutex> l(m_mutex);
+        if (!m_pending_samples.empty()) {
+            m_current_sample = std::move(m_pending_samples.front());
+            m_pending_samples.pop_front();
+            out.buffer = m_current_sample.data();
+            out.size   = m_current_sample.size();
+            drained    = true;
+        }
+    }
+    if (drained) {
+        // Wake any worker thread blocked in Emit() because the queue was full.
+        m_cond.notify_all();
         return OK;
     }
     // Closed transport with nothing left to deliver: tell the recv thread
@@ -374,7 +399,16 @@ void FtpsTransport::WorkerLoop()
             pr = std::move(m_requests.front());
             m_requests.pop_front();
         }
-        Dispatch(pr.body);
+        // Handlers parse JSON and call .get<T>() / iterate arrays without
+        // exhaustive shape checks. A malformed reply mustn't terminate the
+        // process — drop the request and keep the worker alive instead.
+        try {
+            Dispatch(pr.body);
+        } catch (std::exception const& e) {
+            BOOST_LOG_TRIVIAL(warning) << "FtpsTransport::Dispatch threw: " << e.what();
+        } catch (...) {
+            BOOST_LOG_TRIVIAL(warning) << "FtpsTransport::Dispatch threw unknown exception";
+        }
     }
 }
 
@@ -423,14 +457,25 @@ std::string FtpsTransport::FolderForType(std::string const& type)
 
 std::string FtpsTransport::EncodeFtpPath(std::string const& path)
 {
-    // libcurl will URL-decode this; encode characters that confuse the URL parser.
+    // Percent-encode any byte outside RFC 3986's unreserved set. '/' is a
+    // path separator and is left intact. Bambu filenames frequently contain
+    // characters libcurl's URL parser would otherwise mangle (literal '%',
+    // ';', non-ASCII bytes from unicode model titles).
+    static constexpr char hex[] = "0123456789ABCDEF";
     std::string out;
     out.reserve(path.size());
-    for (char c : path) {
-        if (c == ' ') out += "%20";
-        else if (c == '#') out += "%23";
-        else if (c == '?') out += "%3F";
-        else out += c;
+    for (unsigned char c : path) {
+        bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                       || (c >= '0' && c <= '9')
+                       || c == '-' || c == '_' || c == '.' || c == '~'
+                       || c == '/';
+        if (unreserved) {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += hex[(c >> 4) & 0xF];
+            out += hex[c & 0xF];
+        }
     }
     return out;
 }
@@ -445,9 +490,18 @@ void FtpsTransport::Emit(std::string const& json_line, unsigned char const* data
     if (data && data_len)
         buf.insert(buf.end(), data, data + data_len);
     {
-        std::lock_guard<std::mutex> l(m_mutex);
+        // Block the worker until the consumer drains the queue or the
+        // transport is being torn down. Without this a multi-MB SUB_FILE
+        // batch can buffer the whole .gcode.3mf as 256 KB chunks ahead of
+        // the recv thread's drain.
+        std::unique_lock<std::mutex> l(m_mutex);
+        m_cond.wait(l, [this] {
+            return m_quit || m_pending_samples.size() < kMaxPendingSamples;
+        });
+        if (m_quit) return;
         m_pending_samples.push_back(std::move(buf));
     }
+    m_cond.notify_all();
 }
 
 void FtpsTransport::EmitError(int seq, int cmdtype, int result)
@@ -523,10 +577,16 @@ void FtpsTransport::HandleFileDel(int seq, json const& req)
         // timelapse: names only — no folder context, assume /timelapse/
         for (auto& n : req["delete"]) targets.push_back("/timelapse/" + n.get<std::string>());
     }
+    // Sticky failure: surface the first non-success error rather than
+    // overwriting it with a later success. ERROR_PIPE wins over
+    // FILE_NO_EXIST because a transport failure on any item is more
+    // diagnostic than a missing-file report.
     int last_err = 0;
     for (auto& path : targets) {
         int rc = FtpsDelete(path);
-        if (rc != 0) last_err = FILE_NO_EXIST;
+        if (rc == 0) continue;
+        int mapped = (rc == -2) ? FILE_NO_EXIST : ERROR_PIPE;
+        if (last_err != ERROR_PIPE) last_err = mapped;
     }
     EmitError(seq, FILE_DEL, last_err);
 }
@@ -629,12 +689,15 @@ void FtpsTransport::HandleSubFile(int seq, json const& req)
         // a sequence of CONTINUE chunks plus a terminal marker (the last
         // file's terminal marker carries result=SUCCESS to free the seq).
         std::vector<std::string> unique_fps;
-        for (auto& p : req["paths"]) {
-            std::string s    = p.get<std::string>();
-            auto        h    = s.find('#');
-            std::string fp_  = h == std::string::npos ? s : s.substr(0, h);
-            if (std::find(unique_fps.begin(), unique_fps.end(), fp_) == unique_fps.end())
-                unique_fps.push_back(std::move(fp_));
+        if (req.contains("paths") && req["paths"].is_array()) {
+            for (auto& p : req["paths"]) {
+                if (!p.is_string()) continue;
+                std::string s    = p.get<std::string>();
+                auto        h    = s.find('#');
+                std::string fp_  = h == std::string::npos ? s : s.substr(0, h);
+                if (std::find(unique_fps.begin(), unique_fps.end(), fp_) == unique_fps.end())
+                    unique_fps.push_back(std::move(fp_));
+            }
         }
         if (unique_fps.empty()) {
             EmitError(seq, SUB_FILE, FILE_NO_EXIST);
@@ -645,16 +708,16 @@ void FtpsTransport::HandleSubFile(int seq, json const& req)
             std::string const& fp        = unique_fps[fi];
             bool               last_file = (fi + 1 == unique_fps.size());
 
-            // Try cache before fetching.
-            std::vector<unsigned char> full;
-            auto cit = std::find_if(m_zip_cache.begin(), m_zip_cache.end(),
-                                    [&fp](auto const& p) { return p.first == fp; });
-            if (cit != m_zip_cache.end()) {
-                full = cit->second;
-            } else {
+            // Try cache before fetching. Any mutation of m_zip_cache below
+            // (emplace_back / erase) invalidates iterators, so we don't keep
+            // a `cit` around — re-resolve after the mutation is done.
+            bool cache_hit = std::any_of(m_zip_cache.begin(), m_zip_cache.end(),
+                                         [&fp](auto const& p) { return p.first == fp; });
+            std::vector<unsigned char> full_local; // populated only on miss
+            if (!cache_hit) {
                 auto sink = std::function<bool(unsigned char const*, std::size_t)>(
                     [&](unsigned char const* data, std::size_t n) -> bool {
-                        full.insert(full.end(), data, data + n);
+                        full_local.insert(full_local.end(), data, data + n);
                         return !m_quit;
                     });
                 std::int64_t total = 0;
@@ -669,19 +732,33 @@ void FtpsTransport::HandleSubFile(int seq, json const& req)
                     // Skip this file; keep going so the others still emit.
                     continue;
                 }
-                // Move into cache (LRU, capped) — avoids holding two copies
-                // of the .gcode.3mf during the chunk-emit loop below. We re-
-                // bind `full` to a reference into the cache so the chunking
-                // code below works against the cached buffer in place.
-                m_zip_cache.emplace_back(fp, std::move(full));
+                // Move into cache (LRU). Evict on entry count first, then on
+                // total bytes — but never evict the entry we just inserted,
+                // since the chunk loop below reads from it.
+                m_zip_cache.emplace_back(fp, std::move(full_local));
                 while (m_zip_cache.size() > kZipCacheMaxEntries)
                     m_zip_cache.erase(m_zip_cache.begin());
+                auto total_bytes = [this] {
+                    std::size_t n = 0;
+                    for (auto const& e : m_zip_cache) n += e.second.size();
+                    return n;
+                };
+                while (m_zip_cache.size() > 1 && total_bytes() > kZipCacheMaxBytes)
+                    m_zip_cache.erase(m_zip_cache.begin());
             }
-            // From here `full` is either a fresh copy from the cache hit path
-            // above OR the originally-moved buffer now living in the cache.
-            // Bind a reference to the canonical bytes for the chunk loop.
-            std::vector<unsigned char> const& src =
-                (cit != m_zip_cache.end()) ? full : m_zip_cache.back().second;
+            // Re-resolve to get a stable reference to the canonical bytes for
+            // the chunk loop, regardless of whether we hit cache or just
+            // inserted (and possibly shifted entries via eviction).
+            auto cit = std::find_if(m_zip_cache.begin(), m_zip_cache.end(),
+                                    [&fp](auto const& p) { return p.first == fp; });
+            if (cit == m_zip_cache.end()) {
+                if (last_file) {
+                    EmitError(seq, SUB_FILE, FILE_NO_EXIST);
+                    return;
+                }
+                continue;
+            }
+            std::vector<unsigned char> const& src = cit->second;
 
             // Chunk-emit this file. Intermediate chunks: result=CONTINUE,
             // continue=true. Per-file terminal: continue=false. The very last
@@ -728,9 +805,10 @@ void FtpsTransport::HandleSubFile(int seq, json const& req)
     // killing every emit that follows. So skip emitting empty-bytes
     // intermediates entirely; the missing files get their FF_THUMNAIL set by
     // the FinishThumbnail cascade once the last (real) emit terminates.
-    if (!is_zip && req.contains("paths") && !req["paths"].empty()) {
+    if (!is_zip && req.contains("paths") && req["paths"].is_array() && !req["paths"].empty()) {
         auto const& paths = req["paths"];
         for (std::size_t i = 0; i < paths.size(); ++i) {
+            if (!paths[i].is_string()) continue;
             std::string p   = paths[i].get<std::string>();
             bool        last = (i + 1 == paths.size());
             auto        hash = p.find('#');
@@ -770,7 +848,15 @@ void FtpsTransport::HandleSubFile(int seq, json const& req)
                         int idx = mz_zip_reader_locate_file(&zip, sub.c_str(), nullptr, 0);
                         if (idx >= 0) {
                             mz_zip_archive_file_stat st;
-                            if (mz_zip_reader_file_stat(&zip, idx, &st) && st.m_uncomp_size > 0) {
+                            // Cap the uncompressed size we'll allocate. These
+                            // are PNG/JPG plate previews and SHOULD be well
+                            // under a megabyte; the cap defends against a
+                            // corrupt or hostile zip that declares a 4 GB
+                            // entry and triggers a giant allocation/abort.
+                            constexpr std::uint64_t kMaxThumbnailBytes = 32u * 1024u * 1024u;
+                            if (mz_zip_reader_file_stat(&zip, idx, &st)
+                                && st.m_uncomp_size > 0
+                                && st.m_uncomp_size <= kMaxThumbnailBytes) {
                                 bytes.resize((std::size_t) st.m_uncomp_size);
                                 if (!mz_zip_reader_extract_to_mem(&zip, idx, bytes.data(), bytes.size(), 0))
                                     bytes.clear();
@@ -880,6 +966,19 @@ int FtpsTransport::FtpsDelete(std::string const& path)
     auto* curl = static_cast<CURL*>(m_curl);
     if (!curl) return -1;
 
+    // Defense-in-depth at the FTP control-channel boundary. parse_list_line
+    // already strips CR/LF/NUL from filenames it produces, but HandleFileDel
+    // accepts paths from inbound JSON. Reject any control byte here so a
+    // path with embedded \r\n can't inject a second QUOTE command into the
+    // control channel.
+    for (unsigned char c : path) {
+        if (c < 0x20 || c == 0x7F) {
+            BOOST_LOG_TRIVIAL(warning)
+                << "FtpsTransport::FtpsDelete refusing path with control byte";
+            return -1;
+        }
+    }
+
     auto sp = path.find_last_of('/');
     std::string dir  = sp == std::string::npos ? "/" : path.substr(0, sp + 1);
     std::string file = sp == std::string::npos ? path : path.substr(sp + 1);
@@ -902,11 +1001,18 @@ int FtpsTransport::FtpsDelete(std::string const& path)
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
 
     CURLcode rc = curl_easy_perform(curl);
+    long ftp_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &ftp_code);
     curl_slist_free_all(slist);
     if (rc != CURLE_OK) {
         BOOST_LOG_TRIVIAL(warning) << "FtpsTransport::FtpsDelete " << path
-                                   << " failed: " << curl_easy_strerror(rc);
-        return -1;
+                                   << " failed: " << curl_easy_strerror(rc)
+                                   << " (ftp " << ftp_code << ")";
+        // FTP 550 from a QUOTE command means "file not found / no permission".
+        // Anything else is a transport-level failure (TLS handshake, timeout,
+        // connection refused). Surface them differently so the UI doesn't
+        // claim "file not found" on a network blip.
+        return ftp_code == 550 ? -2 : -1;
     }
     return 0;
 }
@@ -941,9 +1047,12 @@ int FtpsTransport::FtpsRetrToOfs(std::string const& path,
     curl_easy_setopt(curl, CURLOPT_FTP_USE_EPSV, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L); // unbounded for large files
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_to_sink);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &wrapped);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_on_quit);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &m_quit);
 
     CURLcode rc = curl_easy_perform(curl);
     if (rc != CURLE_OK) {

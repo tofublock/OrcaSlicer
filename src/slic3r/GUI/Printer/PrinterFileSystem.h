@@ -397,6 +397,10 @@ private:
     boost::thread m_recv_thread;
     Status m_status;
     int m_last_error = 0;
+    // Consecutive Reconnect failures; reset to 0 on a successful Open. Used
+    // to back off the retry interval so a wrong access code or unreachable
+    // printer doesn't hammer the network (and the printer's ftpd) forever.
+    int m_reconnect_attempts = 0;
 
     MediaAbilityList m_media_ability_list;
     std::map<boost::uint32_t, callback_t3>  m_produce_message_cb_map;

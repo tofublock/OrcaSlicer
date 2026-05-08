@@ -98,6 +98,17 @@ private:
     // Don't access from other threads — no mutex protects this field.
     std::vector<std::pair<std::string, std::vector<unsigned char>>> m_zip_cache;
     static constexpr std::size_t kZipCacheMaxEntries = 4;
+    // Byte cap on top of the entry cap. .gcode.3mf can be 200+ MB; with 4
+    // entries the worst-case resident set is several GB. Evict by bytes once
+    // we go past this threshold (but always keep at least one entry — the
+    // caller needs the just-inserted blob to chunk back to the receiver).
+    static constexpr std::size_t kZipCacheMaxBytes = 512u * 1024u * 1024u;
+
+    // Bound the queue of synthesized response samples. Without this the
+    // worker can buffer an entire .gcode.3mf as 256 KB chunks ahead of the
+    // recv thread's drain. With 8 samples × 256 KB the worst-case backlog is
+    // ~2 MB; Emit() blocks the worker until the consumer drains.
+    static constexpr std::size_t kMaxPendingSamples = 8;
 
     std::thread              m_worker;
 

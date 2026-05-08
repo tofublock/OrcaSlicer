@@ -1686,8 +1686,14 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
         if (c) c(result, r, nullptr);
     }
     m_messages.clear();
-    if (result)
-        m_cond.timed_wait(l, boost::posix_time::seconds(10));
+    if (result) {
+        // Exponential backoff so a persistent failure (wrong access code,
+        // printer unreachable, FTPS handshake refused) doesn't retry every
+        // 10s indefinitely. 10s, 20s, 40s, capped at 60s.
+        int wait_s = std::min(60, 10 << std::min(m_reconnect_attempts, 3));
+        m_cond.timed_wait(l, boost::posix_time::seconds(wait_s));
+        if (m_reconnect_attempts < 30) ++m_reconnect_attempts;
+    }
 
 
     while (true) {
@@ -1753,6 +1759,7 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
             l.lock();
             if (ret == 0) {
                 m_transport = std::move(transport);
+                m_reconnect_attempts = 0;
                 wxLogMessage("PrinterFileSystem::Reconnect Connected");
                 break;
             } else if (ret == 1) {
@@ -1766,7 +1773,11 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
         m_status = Status::Failed;
 
         SendChangedEvent(EVT_STATUS_CHANGED, m_status, "", url.size() < 2 ? 1 : m_last_error);
-        m_cond.timed_wait(l, boost::posix_time::seconds(10));
+        // Same exponential schedule as the pre-loop wait above. 10s, 20s,
+        // 40s, capped at 60s.
+        int wait_s = std::min(60, 10 << std::min(m_reconnect_attempts, 3));
+        m_cond.timed_wait(l, boost::posix_time::seconds(wait_s));
+        if (m_reconnect_attempts < 30) ++m_reconnect_attempts;
     }
 
 #ifdef PRINTER_FILE_SYSTEM_TEST
